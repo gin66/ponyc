@@ -11,6 +11,7 @@
 #include <dtrace.h>
 #include <string.h>
 #include "mutemap.h"
+#include <stdio.h> // only added for the debug output... to be removed again
 
 #define PONY_SCHED_BATCH 100
 
@@ -41,6 +42,27 @@ static bool use_yield;
 static mpmcq_t inject;
 static __pony_thread_local scheduler_t* this_scheduler;
 
+/* 
+ * prey_count contains the number of available messages in any queue.
+ * 
+ * As this is concurrently modified by all threads, the value is transient.
+ * 
+ * The idea behind is:
+ *    If a thread is finished with one message and there is no prey,
+ *    then the thread should go to a blocking sleep.
+ *    If there is exactly one prey, then the thread should get it.
+ *    If there is more than one prey, another thread can help with
+ *    processing and so thread should be woken up.
+ *
+ * prey_count modifications should happen together with mpmc accesses.
+ * Thus a nested pop should not lead to double modifications.
+ *  
+ * Outlook: Hopefully thee BLOCK/UNBLOCK/CNF/ACK messages can be removed
+ *          completely
+ */
+static PONY_ATOMIC(uint64_t) prey_count;
+
+
 /**
  * Gets the current active scheduler count
  */
@@ -54,7 +76,12 @@ static uint32_t get_active_scheduler_count()
  */
 static pony_actor_t* pop(scheduler_t* sched)
 {
-  return (pony_actor_t*)ponyint_mpmcq_pop(&sched->q);
+  pony_actor_t* actor = (pony_actor_t*)ponyint_mpmcq_pop(&sched->q);
+  if(actor != NULL)
+    // After an actor has been retrieved, then reduce the prey_count
+    atomic_fetch_sub(&prey_count,1);
+  
+  return actor;
 }
 
 /**
@@ -62,6 +89,9 @@ static pony_actor_t* pop(scheduler_t* sched)
  */
 static void push(scheduler_t* sched, pony_actor_t* actor)
 {
+  // prey_count has to be incremented before putting into the queue.
+  // Otherwise concurrent thread would steal it and prey_count could be negative.
+  atomic_fetch_add(&prey_count,1);
   ponyint_mpmcq_push_single(&sched->q, actor);
 }
 
@@ -72,8 +102,11 @@ static pony_actor_t* pop_global(scheduler_t* sched)
 {
   pony_actor_t* actor = (pony_actor_t*)ponyint_mpmcq_pop(&inject);
 
-  if(actor != NULL)
+  if(actor != NULL) {
+    // After an actor has been retrieved, then reduce the prey_count
+    atomic_fetch_sub(&prey_count,1);
     return actor;
+  }
 
   return pop(sched);
 }
@@ -357,8 +390,12 @@ static pony_actor_t* steal(scheduler_t* sched)
   {
     scheduler_t* victim = choose_victim(sched);
 
-    if(victim == NULL)
+    if(victim == NULL) {
       actor = (pony_actor_t*)ponyint_mpmcq_pop(&inject);
+      // After an actor has been retrieved, then reduce the prey_count
+      if (actor != NULL)
+        atomic_fetch_sub(&prey_count,1);
+    }
     else
       actor = pop_global(victim);
 
@@ -368,6 +405,8 @@ static pony_actor_t* steal(scheduler_t* sched)
       break;
     }
 
+    printf("prey=%llu\n",atomic_load(&prey_count));
+    
     uint64_t tsc2 = ponyint_cpu_tick();
 
     if(read_msg(sched))
@@ -381,6 +420,24 @@ static pony_actor_t* steal(scheduler_t* sched)
       if(actor != NULL)
         break;
     }
+
+    if(atomic_load(&prey_count) > 1) {
+      // More prey than I can steal at once.
+      // Wake up threads
+      ponyint_sched_maybe_wakeup();
+    }
+    if(atomic_load(&prey_count) > 0) {
+      // There is prey. So keep looking
+      continue;
+    }
+
+    // There is no prey. So sleep till prey is available.
+    // sleep waiting for signal to wake up again
+    puts("Going to sleep");
+    ponyint_thread_suspend(sched->sleep_object);
+
+    // No idea, why need below processing. So skip it.
+    continue;
 
     if(quiescent(sched, tsc, tsc2))
     {
@@ -554,6 +611,7 @@ static void run(scheduler_t* sched)
       if(actor == NULL)
       {
         // Termination.
+        puts("Termination");
         pony_assert(pop(sched) == NULL);
         return;
       }
@@ -681,6 +739,7 @@ pony_ctx_t* ponyint_sched_init(uint32_t threads, bool noyield, bool nopin,
   if(min_threads > threads)
     min_threads = threads;
 
+  prey_count = 0;
   scheduler_count = threads;
   min_scheduler_count = min_threads;
   atomic_store_explicit(&active_scheduler_count, scheduler_count,
@@ -771,8 +830,15 @@ void ponyint_sched_add(pony_ctx_t* ctx, pony_actor_t* actor)
     // Add to the current scheduler thread.
     push(ctx->scheduler, actor);
   } else {
+    // prey_count has to be incremented before putting into the queue.
+    // Otherwise concurrent thread would steal it and prey_count could be negative.
+    atomic_fetch_add(&prey_count,1);
+
     // Put on the shared mpmcq.
     ponyint_mpmcq_push(&inject, actor);
+
+    // Make sure one thread is running
+    ponyint_sched_maybe_wakeup();
   }
 }
 
