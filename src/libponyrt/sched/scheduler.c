@@ -434,7 +434,9 @@ static pony_actor_t* steal(scheduler_t* sched)
     // There is no prey. So sleep till prey is available.
     // sleep waiting for signal to wake up again
     puts("Going to sleep");
+    atomic_fetch_sub(&active_scheduler_count,1);
     ponyint_thread_suspend(sched->sleep_object);
+    atomic_fetch_add(&active_scheduler_count,1);
 
     // No idea, why need below processing. So skip it.
     continue;
@@ -829,6 +831,9 @@ void ponyint_sched_add(pony_ctx_t* ctx, pony_actor_t* actor)
   {
     // Add to the current scheduler thread.
     push(ctx->scheduler, actor);
+
+    // Make sure one thread is running
+    ponyint_sched_maybe_wakeup();
   } else {
     // prey_count has to be incremented before putting into the queue.
     // Otherwise concurrent thread would steal it and prey_count could be negative.
@@ -898,9 +903,14 @@ void ponyint_sched_maybe_wakeup()
   uint32_t current_active_scheduler_count = get_active_scheduler_count();
 
   // if we have some schedulers that are sleeping, wake one up
-  if((current_active_scheduler_count < scheduler_count) &&
-    !atomic_exchange_explicit(&scheduler_count_changing, true,
-    memory_order_acquire))
+  if(current_active_scheduler_count < scheduler_count)
+
+  // I have not understood, why need this scheduler_count_changing bool.
+  // In this case it leads to deadlock
+  //
+  //if((current_active_scheduler_count < scheduler_count) &&
+  //  !atomic_exchange_explicit(&scheduler_count_changing, true,
+  //  memory_order_acquire))
   {
     // in case the count changed between the while check and now
     if(get_active_scheduler_count() < scheduler_count)
